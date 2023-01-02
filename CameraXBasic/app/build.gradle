@@ -22,7 +22,7 @@ apply plugin: "androidx.navigation.safeargs"
 android {
     compileSdkVersion 30
     defaultConfig {
-        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        // testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         applicationId "com.android.example.cameraxbasic"
         minSdkVersion 21
         targetSdkVersion 30

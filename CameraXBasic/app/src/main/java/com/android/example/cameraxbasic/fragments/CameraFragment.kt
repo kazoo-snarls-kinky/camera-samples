@@ -17,30 +17,27 @@
 package com.android.example.cameraxbasic.fragments
 
 import android.annotation.SuppressLint
-import android.content.BroadcastReceiver
 import android.content.Context
-import android.content.Intent
 import android.content.IntentFilter
 import android.content.res.Configuration
+import android.graphics.Bitmap
 import android.graphics.Color
-import android.graphics.drawable.ColorDrawable
+import android.graphics.Color.argb
+import android.graphics.Matrix
 import android.hardware.display.DisplayManager
-import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
-import android.view.KeyEvent
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import android.webkit.MimeTypeMap
 import android.widget.Toast
+import androidx.annotation.RequiresApi
 import androidx.camera.core.*
-import androidx.camera.core.ImageCapture.Metadata
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
-import androidx.core.net.toFile
+import androidx.core.graphics.get
 import androidx.core.view.setPadding
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.lifecycleScope
@@ -48,14 +45,10 @@ import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import androidx.navigation.Navigation
 import androidx.window.WindowManager
 import com.android.example.cameraxbasic.KEY_EVENT_ACTION
-import com.android.example.cameraxbasic.KEY_EVENT_EXTRA
 import com.android.example.cameraxbasic.MainActivity
 import com.android.example.cameraxbasic.R
 import com.android.example.cameraxbasic.databinding.CameraUiContainerBinding
 import com.android.example.cameraxbasic.databinding.FragmentCameraBinding
-import com.android.example.cameraxbasic.utils.ANIMATION_FAST_MILLIS
-import com.android.example.cameraxbasic.utils.ANIMATION_SLOW_MILLIS
-import com.android.example.cameraxbasic.utils.simulateClick
 import com.bumptech.glide.Glide
 import com.bumptech.glide.request.RequestOptions
 import kotlinx.coroutines.Dispatchers
@@ -71,9 +64,20 @@ import kotlin.collections.ArrayList
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import androidx.camera.core.FocusMeteringAction
+
+import androidx.camera.core.MeteringPoint
+
+import android.view.MotionEvent
+
+import android.view.View.OnTouchListener
+import androidx.core.graphics.alpha
+import androidx.core.graphics.translationMatrix
+
 
 /** Helper type alias used for analysis use case callbacks */
-typealias LumaListener = (luma: Double) -> Unit
+typealias AnalyzerListener = (mask: Bitmap, matrix: Matrix, inv: Matrix) -> Unit
+// typealias LumaListener = (luma: Double) -> Unit
 
 /**
  * Main fragment for this app. Implements all camera operations including:
@@ -100,6 +104,9 @@ class CameraFragment : Fragment() {
     private var camera: Camera? = null
     private var cameraProvider: ProcessCameraProvider? = null
     private lateinit var windowManager: WindowManager
+    private var transformMatrix : Matrix? = null
+    // private val referenceImage = ByteBuffer.allocate(640 * 480)
+    private var analyzer : LuminosityAnalyzer? = null
 
     private val displayManager by lazy {
         requireContext().getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
@@ -108,7 +115,7 @@ class CameraFragment : Fragment() {
     /** Blocking camera operations are performed using this executor */
     private lateinit var cameraExecutor: ExecutorService
 
-    /** Volume down button receiver used to trigger shutter */
+    /** Volume down button receiver used to trigger shutter
     private val volumeDownReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.getIntExtra(KEY_EVENT_EXTRA, KeyEvent.KEYCODE_UNKNOWN)) {
@@ -119,6 +126,7 @@ class CameraFragment : Fragment() {
             }
         }
     }
+    */
 
     /**
      * We need a display listener for orientation changes that do not trigger a configuration
@@ -156,7 +164,7 @@ class CameraFragment : Fragment() {
         cameraExecutor.shutdown()
 
         // Unregister the broadcast receivers and listeners
-        broadcastManager.unregisterReceiver(volumeDownReceiver)
+        // broadcastManager.unregisterReceiver(volumeDownReceiver)
         displayManager.unregisterDisplayListener(displayListener)
     }
 
@@ -196,7 +204,7 @@ class CameraFragment : Fragment() {
 
         // Set up the intent filter that will receive events from our main activity
         val filter = IntentFilter().apply { addAction(KEY_EVENT_ACTION) }
-        broadcastManager.registerReceiver(volumeDownReceiver, filter)
+        // broadcastManager.registerReceiver(volumeDownReceiver, filter)
 
         // Every time the orientation of device changes, update rotation for use cases
         displayManager.registerDisplayListener(displayListener, null)
@@ -219,6 +227,8 @@ class CameraFragment : Fragment() {
             // Set up the camera and its use cases
             setUpCamera()
         }
+
+        setUpTapToFocus()
     }
 
     /**
@@ -249,8 +259,8 @@ class CameraFragment : Fragment() {
 
             // Select lensFacing depending on the available cameras
             lensFacing = when {
-                hasBackCamera() -> CameraSelector.LENS_FACING_BACK
                 hasFrontCamera() -> CameraSelector.LENS_FACING_FRONT
+                hasBackCamera() -> CameraSelector.LENS_FACING_BACK
                 else -> throw IllegalStateException("Back and front camera are unavailable")
             }
 
@@ -273,6 +283,7 @@ class CameraFragment : Fragment() {
         Log.d(TAG, "Preview aspect ratio: $screenAspectRatio")
 
         val rotation = fragmentCameraBinding.viewFinder.display.rotation
+        Log.d(TAG, "Preview rotation: $rotation")
 
         // CameraProvider
         val cameraProvider = cameraProvider
@@ -300,6 +311,23 @@ class CameraFragment : Fragment() {
                 .setTargetRotation(rotation)
                 .build()
 
+        analyzer = LuminosityAnalyzer(
+            fragmentCameraBinding.viewFinder.width,
+            fragmentCameraBinding.viewFinder.height) { mask: Bitmap, matrix: Matrix, inv: Matrix ->
+            // Values returned from our analyzer are passed to the attached listener
+            // We log image analysis results here - you should do something useful
+            // instead!
+            fragmentCameraBinding.viewOverlay.processData(mask, matrix, inv)
+            transformMatrix = inv
+            val res = preview!!.resolutionInfo!!
+            /*Log.d(TAG, "Crop rectangle: %d %d %d %d".format(
+                res.cropRect.left, res.cropRect.right, res.cropRect.bottom, res.cropRect.top))
+            Log.d(TAG, "Rotation and resolution %d %d %d".format(
+                res.rotationDegrees, res.resolution.width, res.resolution.height))
+
+             */
+        }
+
         // ImageAnalysis
         imageAnalyzer = ImageAnalysis.Builder()
                 // We request aspect ratio but no resolution
@@ -310,13 +338,9 @@ class CameraFragment : Fragment() {
                 .build()
                 // The analyzer can then be assigned to the instance
                 .also {
-                    it.setAnalyzer(cameraExecutor, LuminosityAnalyzer { luma ->
-                        // Values returned from our analyzer are passed to the attached listener
-                        // We log image analysis results here - you should do something useful
-                        // instead!
-                        Log.d(TAG, "Average luminosity: $luma")
-                    })
+                    it.setAnalyzer(cameraExecutor, analyzer!!)
                 }
+
 
         // Must unbind the use-cases before rebinding them
         cameraProvider.unbindAll()
@@ -330,6 +354,9 @@ class CameraFragment : Fragment() {
             // Attach the viewfinder's surface provider to preview use case
             preview?.setSurfaceProvider(fragmentCameraBinding.viewFinder.surfaceProvider)
             observeCameraState(camera?.cameraInfo!!)
+            // fragmentCameraBinding.viewFinder.visibility = View.INVISIBLE
+            fragmentCameraBinding.viewFinder.setBackgroundColor(Color.parseColor("#ffffff"));
+
         } catch (exc: Exception) {
             Log.e(TAG, "Use case binding failed", exc)
         }
@@ -471,6 +498,8 @@ class CameraFragment : Fragment() {
         // Listener for button used to capture photo
         cameraUiContainerBinding?.cameraCaptureButton?.setOnClickListener {
 
+            analyzer!!.onPhotoTaken()
+            /*
             // Get a stable reference of the modifiable image capture use case
             imageCapture?.let { imageCapture ->
 
@@ -484,47 +513,40 @@ class CameraFragment : Fragment() {
                     isReversedHorizontal = lensFacing == CameraSelector.LENS_FACING_FRONT
                 }
 
-                // Create output options object which contains file + metadata
-                val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile)
-                        .setMetadata(metadata)
-                        .build()
-
                 // Setup image capture listener which is triggered after photo has been taken
-                imageCapture.takePicture(
-                        outputOptions, cameraExecutor, object : ImageCapture.OnImageSavedCallback {
+                imageCapture.takePicture(cameraExecutor, object :
+                        ImageCapture.OnImageCapturedCallback() {
+
+                    private fun ByteBuffer.toByteArray(): ByteArray {
+                        rewind()    // Rewind the buffer to zero
+                        val data = ByteArray(remaining())
+                        get(data)   // Copy the buffer into a byte array
+                        return data // Return the byte array
+                    }
+
                     override fun onError(exc: ImageCaptureException) {
                         Log.e(TAG, "Photo capture failed: ${exc.message}", exc)
                     }
 
-                    override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                        val savedUri = output.savedUri ?: Uri.fromFile(photoFile)
-                        Log.d(TAG, "Photo capture succeeded: $savedUri")
+                    override fun onCaptureSuccess(image: ImageProxy) {
+                        Log.i(TAG, "Captured image")
+                        referenceImage.clear()
+                        image.planes[0].buffer.rewind()
 
-                        // We can only change the foreground Drawable using API level 23+ API
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                            // Update the gallery thumbnail with latest picture taken
-                            setGalleryThumbnail(savedUri)
-                        }
+                        Log.d(TAG, "Out buffer properties %d %d %d".format(referenceImage.position(),
+                        referenceImage.limit(), referenceImage.capacity()))
+                        Log.d(TAG, "In buffer properties %d %d %d".format(
+                            image.planes[0].buffer.position(), image.planes[0].buffer.limit(),
+                            image.planes[0].buffer.capacity()))
 
-                        // Implicit broadcasts will be ignored for devices running API level >= 24
-                        // so if you only target API level 24+ you can remove this statement
-                        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
-                            requireActivity().sendBroadcast(
-                                    Intent(android.hardware.Camera.ACTION_NEW_PICTURE, savedUri)
-                            )
-                        }
+                        val arr = image.planes[0].buffer.toByteArray()
+                        Log.d(TAG, "Array size %d".format(arr.size))
+                        referenceImage.put(arr)
+                        image.close()
 
-                        // If the folder selected is an external media directory, this is
-                        // unnecessary but otherwise other apps will not be able to access our
-                        // images unless we scan them using [MediaScannerConnection]
-                        val mimeType = MimeTypeMap.getSingleton()
-                                .getMimeTypeFromExtension(savedUri.toFile().extension)
-                        MediaScannerConnection.scanFile(
-                                context,
-                                arrayOf(savedUri.toFile().absolutePath),
-                                arrayOf(mimeType)
-                        ) { _, uri ->
-                            Log.d(TAG, "Image capture scanned into media store: $uri")
+                        val dbg = referenceImage.toByteArray()
+                        for (i in dbg.indices step 1000) {
+                            Log.d(TAG, "Pixel %d %d".format(i, dbg[i].toInt()))
                         }
                     }
                 })
@@ -539,7 +561,7 @@ class CameraFragment : Fragment() {
                                 { fragmentCameraBinding.root.foreground = null }, ANIMATION_FAST_MILLIS)
                     }, ANIMATION_SLOW_MILLIS)
                 }
-            }
+            }*/
         }
 
         // Setup for button used to switch cameras
@@ -597,18 +619,55 @@ class CameraFragment : Fragment() {
      * <p>All we need to do is override the function `analyze` with our desired operations. Here,
      * we compute the average luminosity of the image by looking at the Y plane of the YUV frame.
      */
-    private class LuminosityAnalyzer(listener: LumaListener? = null) : ImageAnalysis.Analyzer {
+    private class LuminosityAnalyzer(
+        _previewX: Int, _previewY: Int,
+        listener: (Bitmap, Matrix, Matrix) -> Unit) : ImageAnalysis.Analyzer {
         private val frameRateWindow = 8
         private val frameTimestamps = ArrayDeque<Long>(5)
-        private val listeners = ArrayList<LumaListener>().apply { listener?.let { add(it) } }
+        private val listeners = ArrayList<AnalyzerListener>().apply { listener?.let { add(it) } }
         private var lastAnalyzedTimestamp = 0L
+        private val previewX = _previewX
+        private val previewY = _previewY
+        private val prevBuffer = arrayOf(
+            ByteBuffer.allocate(480 * 640),
+            ByteBuffer.allocate(480 * 640),
+            ByteBuffer.allocate(480 * 640)
+        )
+
+        private val refBuffer = arrayOf(
+            ByteBuffer.allocate(480 * 640),
+            ByteBuffer.allocate(480 * 640),
+            ByteBuffer.allocate(480 * 640)
+        )
+
+        private var refPoint : FloatArray? = null
+        private var refValues: FloatArray? = null
+
+        // private var bitmap : Bitmap? = null
         var framesPerSecond: Double = -1.0
             private set
 
         /**
          * Used to add listeners that will be called with each luma computed
          */
-        fun onFrameAnalyzed(listener: LumaListener) = listeners.add(listener)
+        fun onFrameAnalyzed(listener: AnalyzerListener) = listeners.add(listener)
+
+        fun onPhotoTaken() {
+            Log.i(TAG, "Photo taken")
+            for (i in 0 until 3) {
+                refBuffer[i].clear()
+                prevBuffer[i].rewind()
+                refBuffer[i].put(prevBuffer[i])
+            }
+        }
+
+        fun onSetRefPoint(x: Float, y: Float) {
+            refPoint = floatArrayOf(x, y)
+            refValues = floatArrayOf(
+                prevBuffer[0][320*x.toInt() + y.toInt()].toFloat(),
+                prevBuffer[1][320*x.toInt() + y.toInt()].toFloat(),
+                prevBuffer[2][320*x.toInt() + y.toInt()].toFloat())
+        }
 
         /**
          * Helper extension function used to extract a byte array from an image plane buffer
@@ -636,6 +695,7 @@ class CameraFragment : Fragment() {
          * may not be received or the camera may stall, depending on back pressure setting.
          *
          */
+        @RequiresApi(Build.VERSION_CODES.O)
         override fun analyze(image: ImageProxy) {
             // If there are no listeners attached, we don't need to perform analysis
             if (listeners.isEmpty()) {
@@ -659,23 +719,152 @@ class CameraFragment : Fragment() {
 
             lastAnalyzedTimestamp = frameTimestamps.first
 
-            // Since format in ImageAnalysis is YUV, image.planes[0] contains the luminance plane
-            val buffer = image.planes[0].buffer
+            val bitmap0 = imageDiff(image, 0, 250.0f)
+            val bitmap1 = imageDiff(image, 1, 20.0f)
+            val bitmap2 = imageDiff(image, 2, 20.0f)
+            val bitmapDiff = Bitmap.createBitmap(image.width/2, image.height/2, Bitmap.Config.ALPHA_8)
+            for (x in 0 until bitmap1.width) {
+                for (y in 0 until bitmap1.height) {
+                    val ydiff = bitmap0.getPixel(x*2, y*2).alpha
+                    val udiff = bitmap1.getPixel(x, y).alpha
+                    val vdiff = bitmap2.getPixel(x, y).alpha
+                    if (false && x % 123 == 0 && y % 123 == 0) {
+                        Log.d("KK", "%d %d %d".format(ydiff, udiff, vdiff))
+                    }
+                    val sq = { i: Int -> i * i }
+                    val color = if (sq(ydiff) + sq(udiff) + sq(vdiff) < 2*sq(100)) 0 else 255
+                    bitmapDiff.setPixel(x, y, argb(color, 255, 255, 255).toInt())
+                }
+            }
+
+            var ratio = max(previewX.toFloat() / image.height, previewY.toFloat() / image.width)
+            val matrix = Matrix()
+            val inv = Matrix()
+            matrix.postRotate(270.0f)
+            matrix.postScale(1.0f, -1.0f)
+            matrix.postScale(ratio, ratio)
+            matrix.postScale(2.0f, 2.0f)
+
+            val cropX = max(0.0f, (image.height * ratio - previewX) / 2)
+            val cropY = max(0.0f, (image.width * ratio - previewY) / 2)
+            matrix.postTranslate(-cropX, -cropY)
+
+            val pts = floatArrayOf(100.0f, 200.0f)
+            matrix.mapPoints(pts)
+            Log.d("KK", "%f %f".format(pts[0], pts[1]))
+
+            inv.postTranslate(cropX, cropY)
+            inv.postScale(1.0f / (2.0f*ratio), 1.0f / (-2.0f*ratio))
+            inv.postRotate(90.0f)
+
+            val pts2 = floatArrayOf(1100.0f, 700.0f)
+            inv.mapPoints(pts2)
+            Log.d("KK", "%f %f".format(pts2[0], pts2[1]))
+            // val bitmap1 = Bitmap.createScaledBitmap(bitmap0, scaledW, scaledH, true)
+            /*val rotated =
+                Bitmap.createBitmap(bitmapDiff, 0, 0, bitmap0.width, bitmap0.height, matrix, true)
+            val scaled = Bitmap.createBitmap(
+                rotated,
+                cropX,
+                cropY,
+                rotated.width - cropX,
+                rotated.height - cropY
+            )*/
+
+            // Call all listeners with new value
+            listeners.forEach { it(bitmapDiff, matrix, inv) }
+
+            image.close()
+        }
+
+        private fun imageDiff(image: ImageProxy, planeIdx: Int, maxDist: Float): Bitmap {
+            val buffer = image.planes[planeIdx].buffer
 
             // Extract image data from callback object
             val data = buffer.toByteArray()
 
-            // Convert the data into an array of pixel values ranging 0-255
-            val pixels = data.map { it.toInt() and 0xFF }
+            prevBuffer[planeIdx].clear()
+            prevBuffer[planeIdx].put(data)
 
-            // Compute average luminance for the image
-            val luma = pixels.average()
+            // Log.d(TAG, "Plane $planeIdx: Sizes of image: %d %d %d %d %d".format(
+            //    data.size, image.width, image.height, image.planes[planeIdx].pixelStride, image.planes[planeIdx].rowStride))
 
-            // Call all listeners with new value
-            listeners.forEach { it(luma) }
+            val ref = refBuffer[planeIdx].toByteArray()
+            var W = image.width
+            var H = image.height
+            if (planeIdx >= 1) {
+                W /= 2
+                H /= 2
+            }
+            val bitmap0 = Bitmap.createBitmap(W, H, Bitmap.Config.ALPHA_8)
+            var zeros = 0
+            var ones = 0
 
-            image.close()
+            // var scaledH = (image.height.toFloat() * ratio).toInt()
+            // var scaledW = (image.width.toFloat() * ratio).toInt()
+            var skipped = 0
+            for (i in 0 until data.size) {
+                if (ref[i].toFloat() < maxDist) {
+                    zeros += 1
+                } else {
+                    ones += 1
+                }
+                var dist = abs(data[i].toUByte().toInt() - ref[i].toUByte().toInt())
+                if (refPoint != null) {
+                    var refX = refPoint!![0].toInt()
+                    var refY = refPoint!![1].toInt()
+                    if (planeIdx == 0) {
+                        refX *= 2
+                        refY *= 2
+                    }
+                    val refI = refY*W + refX
+                    dist = abs(data[i].toUByte().toInt() - data[refI].toUByte().toInt())
+                }
+
+                if (i < ref.size && dist.toFloat() < maxDist) {
+                    skipped += 1
+                    continue
+                }
+                var x = i % W
+                var y = i / W
+                val color = argb(dist, 255, 255, 255).toInt()
+                bitmap0.setPixel(x, y, color)
+                if (false && x % 123 == 0 && y % 123 == 0) {
+                    Log.d("KK", "%d %d %d %d %d %d".format(planeIdx, x, y, dist, color, bitmap0[x, y].alpha))
+                }
+                /*
+                var outX = (y.toFloat() * ratio).toInt()
+                var outY = (x.toFloat() * ratio).toInt()
+                var outX1 = ((y+1).toFloat() * ratio).toInt()
+                var outY1 = ((x+1).toFloat() * ratio).toInt()
+                for (x in outX until outX1)
+                    for (y in outY until outY1) {
+                        val xx = x - (scaledH - previewX) / 2
+                        val yy = y - (scaledW - previewY) / 2
+                        if (xx < 0 || xx >= previewX || yy < 0 || yy >= previewY) continue
+                        bitmap!!.setPixel(xx, yy, color)
+                    }*/
+            }
+            Log.d(TAG, "Bitmap composition for plane $planeIdx: $skipped $zeros $ones")
+            return bitmap0
         }
+    }
+
+    private fun setUpTapToFocus() {
+        fragmentCameraBinding.viewOverlay.setOnTouchListener(OnTouchListener { v, event ->
+            if (event.action != MotionEvent.ACTION_UP) {
+                return@OnTouchListener true
+            }
+            Log.d("KK", "Touch. %f %f".format(event.x, event.y))
+            val inv = Matrix()
+            if (transformMatrix!!.invert(inv)) {
+                val arr = floatArrayOf(event.x, event.y)
+                transformMatrix!!.mapPoints(arr)
+                Log.d("KK", "Touch in camera coordinates %f %f".format(arr[0], arr[1]))
+                analyzer!!.onSetRefPoint(arr[0], arr[1])
+            }
+            return@OnTouchListener false
+        })
     }
 
     companion object {
